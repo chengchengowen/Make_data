@@ -1,0 +1,454 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Jul  1 17:31:26 2013
+
+@author: hanwei
+modified by lyq, 2014.01.10
+"""
+
+from multiprocessing import Process
+from multiprocessing import Pool
+
+import os
+import sys
+import util
+import scipy.misc
+import scipy.io
+import numpy as np
+import random
+import string
+import cv2
+
+SIZE = 128
+CHANNELS = 1 
+NUM_PER_PATCH = 1024
+Mean_Img_Num = 5000
+NUM_IMG = 100
+
+ 
+ 
+def getBatch(meta, allLabels):
+    global SIZE, CHANNELS
+    print " going to load %d images " % len(meta)
+    data = np.zeros((SIZE*SIZE*CHANNELS, len(meta)), dtype=np.uint8)
+    labels = np.zeros((len(meta)), dtype=np.single)
+    imgnames = []
+    
+    # for line in meta:
+    #     str = line.strip()
+
+    #     label[] = tmp[length - 2]
+    #     if label not in allLabels:
+    #         allLabels.append(label) 
+
+
+
+    for i in range(0,len(meta)):
+        str = meta[i].strip()
+        tmp = str.split('/')
+        length = len(tmp)
+        labels[i] = allLabels.index(tmp[length - 2])
+        imgnames.append(tmp[length - 1])
+        try:
+            data[:,i] = load_img_data(meta[i].strip())
+                  
+        except IOError as e:
+            print meta[i].strip()
+            exit(1)
+    return data, labels, imgnames
+
+ 
+def fixLabel(labels):
+    synnet_meta_file = '/data2/ILSVRC2010/meta.mat'
+    synnet_meta = scipy.io.loadmat(synnet_meta_file)
+    synnet_meta = synnet_meta['synsets'][:1000]
+    ILSVRC_ID = [item[0][0][0][0] for item in synnet_meta]
+    ImageNet_ID = [item[0][1][0] for item in synnet_meta]
+
+    train_dir = "/data1/LSVRC2010/train"
+    subdirnames = os.listdir(train_dir)
+    list.sort(subdirnames)
+    realID = [subdirnames.index(id) for id in ImageNet_ID]
+
+    for i in range(len(labels)):
+        labels[i] = realID[int(round(labels[i]))]
+
+    
+
+def collectAndShuffle(train_dir):
+    allImgMeta = []
+    allLabels = []
+    subdirnames = os.listdir(train_dir)
+    list.sort(subdirnames)
+    for classLabel, subdir in enumerate(subdirnames):
+        allLabels.append(subdir)
+        imgnames = os.listdir(os.path.join(train_dir, subdir))
+        fullnames = [os.path.join(train_dir, subdir, name) for name in imgnames]
+        # name, label pair
+        #meta = zip(fullnames, [string.atoi(subdir)] * len(fullnames))
+        meta = zip(fullnames, [classLabel] * len(fullnames))
+        allImgMeta += meta
+    print "####### Got %d classes ######" % len(allLabels)
+    print "####### Got %d images ######" % len(allImgMeta)
+    print "shuffling..."
+    random.shuffle(allImgMeta)
+    return allImgMeta, allLabels
+        
+
+def makeBatches(allImgMeta, out_dir, batchSize, startIdx = 0):
+    numImg = len(allImgMeta)
+    numBatches = numImg / batchSize # the last batch keep the remainder
+    if numImg % batchSize != 0:
+        numBatches += 1
+
+    print 'Going to make %d baches' % numBatches
+    for idx_batch in range(numBatches):
+        #        if idx_batch < numBatches - 2:
+        #            continue
+        print "### Making the %dth batch ###" % idx_batch
+        b_start = batchSize * idx_batch
+        b_end = batchSize * (idx_batch + 1)
+        if idx_batch == numBatches - 1:
+            b_start = numImg - batchSize
+            b_end = numImg
+        batchMeta = allImgMeta[b_start:b_end]
+        data, labels, imgnames = getBatch(batchMeta)
+        #labels1 = labels//2
+        #labels2 = labels//3
+        #labels3 = labels//4
+
+        out_fname = os.path.join(out_dir, "data_batch_%04d" % (idx_batch+startIdx))
+        print "saving to %s" % out_fname
+        util.pickle(out_fname, {'data':data, 'labels':labels, 'images':imgnames})
+            
+
+
+
+
+#lyq add
+def collectOneClass(classFolder):
+    global SIZE, CHANNELS
+    filelist = os.listdir(classFolder)
+    list_len = len(filelist)
+    if list_len > 300:
+        del filelist[300:list_len]
+    list.sort(filelist)
+    dataCol = np.zeros((len(filelist), SIZE*SIZE*CHANNELS), dtype = np.uint8)
+    for index, filename in enumerate(filelist):
+        dataCol[index,:] = readAndResize(os.path.join(classFolder, filename))
+    return dataCol
+
+def collectImgByClass(inFolder, outFolder):
+    subFolderList = os.listdir(inFolder)
+    list.sort(subFolderList)
+    for index, foldername in enumerate(subFolderList):
+        print foldername
+        #if index > 10000:
+        dataCol = collectOneClass(os.path.join(inFolder, foldername))
+        util.pickle(outFolder +"/"+ foldername, dataCol)
+
+ 
+def prepareTrain(train_list, outFolder):
+    global NUM_PER_PATCH
+    fileList = open(train_list,'rb').readlines()
+    random.shuffle(fileList)
+
+    if len(fileList) < Mean_Img_Num:
+         num_mean_img = len(fileList)
+    else:
+         num_mean_img = Mean_Img_Num
+
+    data = np.zeros((SIZE*SIZE*CHANNELS, num_mean_img), dtype=np.uint8)
+
+    for i in range(0,num_mean_img):
+        data[:,i] = readAndResize(fileList[i].strip())
+
+
+    
+
+    tmp = data.reshape(data.shape[1],data.shape[0])
+    dataSum = np.sum(tmp, axis=0, dtype = np.float64)
+
+    globalCount = tmp.shape[0]
+    meanImg = dataSum / globalCount
+    util.pickle(outFolder+"/meanImg", meanImg)
+    
+    allLabels = []
+    allImgMeta = []
+    for line in fileList:
+        str = line.strip()
+        tmp = str.split('/')
+        length = len(tmp)
+        label = tmp[length - 2]
+        #print label
+        if label not in allLabels:
+            allLabels.append(label)            
+
+    print "####### Got %d classes ######" % len(allLabels)
+    meta = {}
+    meta['data_mean'] = meanImg
+    meta['label_names'] = allLabels
+    util.pickle( os.path.join(out_dir, "batches.meta"), meta)
+
+
+
+
+    numImg = len(fileList)
+    numBatches = numImg / NUM_PER_PATCH # the last batch keep the remainder
+    if numImg % NUM_PER_PATCH != 0:
+        numBatches += 1
+
+    print 'Going to make %d baches' % numBatches
+    for idx_batch in range(numBatches):
+        #        if idx_batch < numBatches - 2:
+        #            continue
+        print "### Making the %dth batch ###" % idx_batch
+        b_start = NUM_PER_PATCH * idx_batch
+        b_end = NUM_PER_PATCH * (idx_batch + 1)
+        if idx_batch == numBatches - 1:
+            b_start = numImg - NUM_PER_PATCH
+            b_end = numImg
+        batchMeta = fileList[b_start:b_end]
+
+        data, labels, imgnames = getBatch(batchMeta,allLabels)
+        out_fname = os.path.join(out_dir, "data_batch_%04d" % idx_batch)
+        print "saving to %s" % out_fname
+        util.pickle(out_fname, {'data':data, 'labels':labels, 'images':imgnames})
+
+    #fileList.close()
+
+
+def processTest(test_list, out_dir, startIdx):
+    global NUM_PER_PATCH
+    meta = util.unpickle(os.path.join(out_dir, "batches.meta"))
+    allLabels = meta['label_names']
+
+
+    fileList = open(test_list,'rb').readlines()
+    random.shuffle(fileList)
+
+    print "####### Got %d classes ######" % len(allLabels)
+    print "####### Got %d images ######" % len(fileList)
+
+    numImg = len(fileList)
+    numBatches = numImg / NUM_PER_PATCH # the last batch keep the remainder
+    if numImg % NUM_PER_PATCH != 0:
+        numBatches += 1
+
+    print 'Going to make %d baches' % numBatches
+    for idx_batch in range(numBatches):
+        #        if idx_batch < numBatches - 2:
+        #            continue
+        print "### Making the %dth batch ###" % idx_batch
+        b_start = NUM_PER_PATCH * idx_batch
+        b_end = NUM_PER_PATCH * (idx_batch + 1)
+        if idx_batch == numBatches - 1:
+            b_start = numImg - NUM_PER_PATCH
+            b_end = numImg
+        batchMeta = fileList[b_start:b_end]
+
+        data, labels, imgnames = getBatch(batchMeta,allLabels)
+        out_fname = os.path.join(out_dir, "data_batch_%04d" % (idx_batch+startIdx))
+        print "saving to %s" % out_fname
+        util.pickle(out_fname, {'data':data, 'labels':labels, 'images':imgnames})
+
+    #fileList.close()
+
+def prepare_list(Folder, outFolder):
+
+    subFolderList = os.listdir(outFolder)
+    list.sort(subFolderList)
+    for index, fname in enumerate(subFolderList):
+        #print fname
+        os.remove(os.path.join(outFolder, fname))
+        print "removed   " + fname
+        #f=open(name,"rb")
+        #fileList = open(os.path.join(outFolder, fname),'rb').readlines()
+
+        #if len(fileList) < NUM_IMG:
+             
+
+    allLabels = []
+   
+    for i, FolderName in enumerate(Folder):
+        #print FolderName
+        subFolderList = os.listdir(FolderName)
+        list.sort(subFolderList)
+        #print subFolderList
+        for index, labelname in enumerate(subFolderList):
+            #print os.path.join(Folder, fname)
+            #imgnames = os.listdir(os.path.join(Folder, fname))
+            #print imgnames
+            if labelname not in allLabels:
+                allLabels.append(labelname)
+            #print FolderName
+            
+            pic_fname = os.listdir(os.path.join(FolderName,labelname))
+            #print 
+            if len(pic_fname) != 0:
+                f=open(os.path.join(outFolder,"%s.npy" % labelname),"ab")
+            
+                for idx, picname in enumerate(pic_fname):
+                    pic_list = os.path.join(FolderName,labelname,picname)
+                    tmp = pic_list + "\n"
+                    f.writelines(tmp)
+                #flist.append(pic_list)
+                f.close()
+
+def del_People(outFolder):
+
+    subFolderList = os.listdir(outFolder)
+    list.sort(subFolderList)
+    for index, fname in enumerate(subFolderList):
+        #f=open(name,"rb")
+        fileList = open(os.path.join(outFolder, fname),'rb').readlines()
+
+        if len(fileList) < NUM_IMG:
+            os.remove(os.path.join(outFolder, fname))   
+
+def load_img_data(fileName):
+    global SIZE, CHANNELS
+    #img = scipy.misc.imread(fileName)
+
+    img = cv2.imread(fileName,0)
+ 
+
+
+    #img = img[42:170,42:170]
+
+    resizedImg = cv2.resize(img,(SIZE,SIZE))
+
+    vec = np.reshape(resizedImg, SIZE*SIZE)
+
+
+    #vec = np.reshape(resizedImg,SIZE*SIZE)
+    #
+
+    #cv2.resize(img,img,(SIZE,SIZE))
+
+    #out = img.resize(())
+
+    #img.colRange(16,176).rowRange(16,176).copyTo(face)
+
+
+    #cv2.imshow("img",resizedImg)
+
+    #cv2.waitKey(0)
+
+    return vec
+
+def prepare_Train(list_dir, out_dir):
+
+    flist = [fname for fname in os.listdir(list_dir) if fname.endswith('.npy')]
+
+    print len(flist)
+
+    img_list = []
+    #for fname in flist:
+    for index, fname in enumerate(flist):
+        img_list += open(os.path.join(list_dir,fname),'rb').readlines()
+
+        #global NUM_PER_PATCH
+    #fileList = open(train_list,'rb').readlines()
+    random.shuffle(img_list)
+
+    if len(img_list) < Mean_Img_Num:
+         num_mean_img = len(img_list)
+    else:
+         num_mean_img = Mean_Img_Num
+
+    data = np.zeros((SIZE*SIZE*CHANNELS, num_mean_img), dtype=np.uint8)
+
+    for i in range(0,num_mean_img):
+        data[:,i] = load_img_data(img_list[i].strip())
+
+
+    
+
+    tmp = data.reshape(data.shape[1],data.shape[0])
+    dataSum = np.sum(tmp, axis=0, dtype = np.float64)
+
+    globalCount = tmp.shape[0]
+    meanImg = dataSum / globalCount
+    util.pickle(out_dir+"/meanImg", meanImg)
+    
+    allLabels = []
+    allImgMeta = []
+    for line in img_list:
+        str = line.strip()
+        tmp = str.split('/')
+        length = len(tmp)
+        label = tmp[length - 2]
+        #print label
+        if label not in allLabels:
+            allLabels.append(label)            
+
+    print "####### Got %d classes ######" % len(allLabels)
+    meta = {}
+    meta['data_mean'] = meanImg
+    meta['label_names'] = allLabels
+    util.pickle( os.path.join(out_dir, "batches.meta"), meta)
+
+
+
+
+    numImg = len(img_list)
+    numBatches = numImg / NUM_PER_PATCH # the last batch keep the remainder
+    if numImg % NUM_PER_PATCH != 0:
+        numBatches += 1
+
+    print 'Going to make %d baches' % numBatches
+    for idx_batch in range(numBatches):
+        #        if idx_batch < numBatches - 2:
+        #            continue
+        print "### Making the %dth batch ###" % idx_batch
+        b_start = NUM_PER_PATCH * idx_batch
+        b_end = NUM_PER_PATCH * (idx_batch + 1)
+        if idx_batch == numBatches - 1:
+            b_start = numImg - NUM_PER_PATCH
+            b_end = numImg
+        batchMeta = img_list[b_start:b_end]
+
+        data, labels, imgnames = getBatch(batchMeta,allLabels)
+        out_fname = os.path.join(out_dir, "data_batch_%04d" % idx_batch)
+        print "saving to %s" % out_fname
+        util.pickle(out_fname, {'data':data, 'labels':labels, 'images':imgnames})
+
+
+if __name__ == '__main__':
+
+    fname = []
+
+    list_dir = "/home/chengcheng/pair"
+
+    folder1 = "/database_001/img/face/Alignment_160/ID_Card"
+    fname.append(folder1)
+
+    folder1 = "/database_001/img/face/Alignment_160/array"
+    fname.append(folder1)
+
+    folder1 = "/database_001/img/face/Alignment_160/CAS_PEA"
+    fname.append(folder1)
+    folder1 = "/database_001/img/face/Alignment_160/Movie"
+    fname.append(folder1)
+    folder1 = "/database_001/img/face/Alignment_160/multi_pie"
+    fname.append(folder1)
+    folder1 = "/database_001/img/face/Alignment_160/sel_cqbz"
+    fname.append(folder1)
+
+    folder1 = "/database_001/img/face/Alignment_160/Star"
+    fname.append(folder1)
+
+    folder1 = "/database_001/img/face/Alignment_160/PolyU"
+    fname.append(folder1)
+
+    prepare_list(fname, list_dir)
+
+    del_People(list_dir)
+
+
+    out_dir = '/database_001/batches/face/grey'
+
+    prepare_Train(list_dir, out_dir)
+
+    
